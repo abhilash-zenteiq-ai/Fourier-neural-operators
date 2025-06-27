@@ -39,7 +39,7 @@ model.compile(optimizer='adam', loss='mse')
 
 # ============ Training ============
 batch_size = 20
-epochs = 10
+epochs = 50
 train_losses = []
 
 for epoch in range(epochs):
