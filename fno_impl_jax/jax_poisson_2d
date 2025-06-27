@@ -22,105 +22,18 @@
 # For any clarifications or special considerations,
 # please contact: contact@scirex.org
 
-from flask import Flask, render_template, send_file
 import jax
 import jax.numpy as jnp
 import equinox as eqx
 import optax
 import matplotlib.pyplot as plt
 import os
-import io
-import base64
 
-# Initialize Flask app
-app = Flask(__name__)
+from scirex.core.sciml.fno.models.fno_2d import FNO2d
 
-# --- FNO2d Model Definition (Copied from your original code for self-containment) ---
-class FNO2d(eqx.Module):
-    conv_layers: list
-    fourier_layers: list
-    linear_layers: list
-    width: int
-    activation: callable
 
-    def __init__(self, in_channels, out_channels, modes1, modes2, width, activation, n_blocks, *, key):
-        key1, key2, key3 = jax.random.split(key, 3)
-
-        self.width = width
-        self.activation = activation
-
-        # Input linear layer
-        self.conv_layers = [eqx.nn.Conv2d(in_channels, width, kernel_size=1, key=key1)]
-
-        # Fourier blocks
-        self.fourier_layers = []
-        for _ in range(n_blocks):
-            self.fourier_layers.append(FourierBlock2d(width, width, modes1, modes2, key=jax.random.split(key2)[0]))
-            key2, _ = jax.random.split(key2)
-
-        # Output linear layers
-        self.linear_layers = [
-            eqx.nn.Conv2d(width, width, kernel_size=1, key=key3),
-            eqx.nn.Conv2d(width, out_channels, kernel_size=1, key=jax.random.split(key3)[0])
-        ]
-
-    def __call__(self, x):
-        x = self.conv_layers[0](x)
-        x = x.transpose(0, 2, 3, 1) # (N, H, W, C)
-
-        for f_block in self.fourier_layers:
-            x = f_block(x)
-            x = self.activation(x)
-
-        x = x.transpose(0, 3, 1, 2) # (N, C, H, W)
-        x = self.linear_layers[0](x)
-        x = self.activation(x)
-        x = self.linear_layers[1](x)
-        return x
-
-class FourierBlock2d(eqx.Module):
-    w1: eqx.nn.Conv2d
-    w2: eqx.nn.Conv2d
-    b1: eqx.nn.Conv2d
-    b2: eqx.nn.Conv2d
-    modes1: int
-    modes2: int
-
-    def __init__(self, in_channels, out_channels, modes1, modes2, *, key):
-        key1, key2, key3, key4 = jax.random.split(key, 4)
-        self.w1 = eqx.nn.Conv2d(in_channels, out_channels, kernel_size=1, key=key1)
-        self.w2 = eqx.nn.Conv2d(in_channels, out_channels, kernel_size=1, key=key2)
-        self.b1 = eqx.nn.Conv2d(in_channels, out_channels, kernel_size=1, key=key3)
-        self.b2 = eqx.nn.Conv2d(in_channels, out_channels, kernel_size=1, key=key4)
-        self.modes1 = modes1
-        self.modes2 = modes2
-
-    def __call__(self, x):
-        # x is (N, H, W, C)
-        batch_size, h, w, c = x.shape
-
-        # Fourier transform
-        x_ft = jnp.fft.rfft2(x, axes=(1, 2))
-
-        # Multiply relevant modes
-        out_ft = jnp.zeros_like(x_ft)
-        out_ft = out_ft.at[:, :self.modes1, :self.modes2, :].set(
-            x_ft[:, :self.modes1, :self.modes2, :] * self.b1.weight
-        )
-        out_ft = out_ft.at[:, -self.modes1:, :self.modes2, :].set(
-            x_ft[:, -self.modes1:, :self.modes2, :] * self.b2.weight
-        )
-
-        # Inverse Fourier transform
-        x_fourier = jnp.fft.irfft2(out_ft, s=(h, w), axes=(1, 2))
-
-        # Linear transform
-        x_linear = self.w2(self.w1(x.transpose(0, 3, 1, 2))).transpose(0, 2, 3, 1)
-
-        return x_fourier + x_linear
-
-# --- Data Generation Function ---
 def generate_poisson_data(n_samples=1200, nx=64, ny=64, m_max=5, n_max=5, key=jax.random.PRNGKey(0)):
+    """Generate Poisson data with f(x,y) = sin(mπx)sin(nπy), and analytical solution"""
     x = jnp.linspace(0, 1, nx)
     y = jnp.linspace(0, 1, ny)
     X, Y = jnp.meshgrid(x, y)
@@ -150,136 +63,98 @@ def generate_poisson_data(n_samples=1200, nx=64, ny=64, m_max=5, n_max=5, key=ja
 
     return input_data, output_data, x, y, m_vals, n_vals
 
-# --- Global variables to store trained model and results ---
-trained_model = None
-test_data = None
-test_true_solutions = None
-test_predictions = None
-test_mse_value = None
-training_losses = []
-plot_data_for_web = {} # Stores image data for web display
 
-# --- Model Training and Plot Generation (Run once on app startup) ---
-def train_and_generate_plots():
-    global trained_model, test_data, test_true_solutions, test_predictions, test_mse_value, training_losses, plot_data_for_web
+# Generate data
+input_data, output_data, x, y, m_vals, n_vals = generate_poisson_data()
 
-    print("Generating data...")
-    input_data, output_data, x, y, m_vals, n_vals = generate_poisson_data(n_samples=1200)
+# Train/test split
+train_x, test_x = input_data[:1000], input_data[1000:]
+train_y, test_y = output_data[:1000], output_data[1000:]
 
-    train_x, test_x = input_data[:1000], input_data[1000:]
-    train_y, test_y = output_data[:1000], output_data[1000:]
+# Model setup
+model = FNO2d(
+    in_channels=3,    # f(x,y), x, y
+    out_channels=1,   # u(x,y)
+    modes1=12,
+    modes2=12,
+    width=64,
+    activation=jax.nn.gelu,
+    n_blocks=4,
+    key=jax.random.PRNGKey(0),
+)
 
-    print("Setting up model...")
-    model = FNO2d(
-        in_channels=3,
-        out_channels=1,
-        modes1=12,
-        modes2=12,
-        width=64,
-        activation=jax.nn.gelu,
-        n_blocks=4,
-        key=jax.random.PRNGKey(0),
-    )
+# Optimizer
+optimizer = optax.adam(1e-3)
+opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-    optimizer = optax.adam(1e-3)
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-    @eqx.filter_jit
-    def make_step(model, opt_state, batch):
-        def loss_fn(model):
-            pred = jax.vmap(model)(batch[0])
-            return jnp.mean((pred - batch[1]) ** 2)
+@eqx.filter_jit
+def make_step(model, opt_state, batch):
+    def loss_fn(model):
+        pred = jax.vmap(model)(batch[0])
+        return jnp.mean((pred - batch[1]) ** 2)
 
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
-        updates, opt_state = optimizer.update(grads, opt_state, model)
-        model = eqx.apply_updates(model, updates)
-        return loss, model, opt_state
+    loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
+    updates, opt_state = optimizer.update(grads, opt_state, model)
+    model = eqx.apply_updates(model, updates)
+    return loss, model, opt_state
 
-    print("Starting training loop...")
-    batch_size = 50
-    n_epochs = 50
-    losses = []
 
-    for epoch in range(n_epochs):
-        for i in range(0, len(train_x), batch_size):
-            batch = (train_x[i:i+batch_size], train_y[i:i+batch_size])
-            loss, model, opt_state = make_step(model, opt_state, batch)
-            losses.append(loss)
+# Training loop
+batch_size = 50
+n_epochs = 50
+losses = []
 
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch}, Loss: {loss:.6f}")
+for epoch in range(n_epochs):
+    for i in range(0, len(train_x), batch_size):
+        batch = (train_x[i:i+batch_size], train_y[i:i+batch_size])
+        loss, model, opt_state = make_step(model, opt_state, batch)
+        losses.append(loss)
 
-    trained_model = model
-    training_losses = losses
-    print("Training complete.")
+    if epoch % 10 == 0:
+        print(f"Epoch {epoch}, Loss: {loss:.6f}")
 
-    print("Evaluating on test data...")
-    test_predictions = jax.vmap(trained_model)(test_x)
-    test_mse_value = jnp.mean((test_predictions - test_y) ** 2)
-    test_data = test_x # Store input data for plots
-    test_true_solutions = test_y # Store true solutions for plots
-    print(f"Test MSE: {test_mse_value:.6f}")
+# Evaluation
+test_pred = jax.vmap(model)(test_x)
+test_error = jnp.mean((test_pred - test_y) ** 2)
+print(f"Test MSE: {test_error:.6f}")
 
-    # Generate and save plots for the first test sample
-    print("Generating plots for web display...")
-    sample_idx = 0 # Use the first test sample for static display
-    
-    # Plotting function
-    def plot_and_encode(data_array, title, cmap_name="viridis"):
-        plt.figure(figsize=(5, 4))
-        plt.imshow(data_array, cmap=cmap_name)
-        plt.colorbar()
-        plt.title(title)
-        plt.axis('off') # Hide axes for cleaner look
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight')
-        plt.close()
-        buf.seek(0)
-        return base64.b64encode(buf.getvalue()).decode('utf-8')
+# Save outputs
+output_dir = os.path.join(os.path.dirname(__file__), "outputs", "poisson_sine")
+os.makedirs(output_dir, exist_ok=True)
 
-    plot_data_for_web['f_plot'] = plot_and_encode(
-        test_data[sample_idx, 0], f"Forcing Function (m={m_vals[1000+sample_idx]}, n={n_vals[1000+sample_idx]})"
-    )
-    plot_data_for_web['u_plot'] = plot_and_encode(
-        test_true_solutions[sample_idx, 0], "True Solution"
-    )
-    plot_data_for_web['pred_plot'] = plot_and_encode(
-        test_predictions[sample_idx, 0], "FNO Prediction"
-    )
-    plot_data_for_web['error_plot'] = plot_and_encode(
-        jnp.abs(test_predictions[sample_idx, 0] - test_true_solutions[sample_idx, 0]), "Absolute Error", "inferno"
-    )
-    
-    # Training loss plot
-    plt.figure(figsize=(6, 4))
-    plt.semilogy(training_losses)
-    plt.title("Training Loss")
-    plt.xlabel("Step")
-    plt.ylabel("MSE (log scale)")
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight')
-    plt.close()
-    buf.seek(0)
-    plot_data_for_web['training_loss_plot'] = base64.b64encode(buf.getvalue()).decode('utf-8')
+# Plot predictions
+plt.figure(figsize=(15, 5))
 
-    print("Plots generated and encoded.")
+plt.subplot(131)
+plt.imshow(test_x[0, 0], cmap="viridis")
+plt.colorbar()
+plt.title("Source $f(x,y) = \\sin(m\\pi x) \\sin(n\\pi y)$")
 
-# Run training and plot generation on app startup
-with app.app_context():
-    train_and_generate_plots()
+plt.subplot(132)
+plt.imshow(test_y[0, 0], cmap="viridis")
+plt.colorbar()
+plt.title("True solution $u(x,y)$")
 
-# --- Flask Routes ---
-@app.route('/')
-def index():
-    return render_template('index.html',
-                           test_mse=f"{test_mse_value:.4e}",
-                           f_plot=plot_data_for_web['f_plot'],
-                           u_plot=plot_data_for_web['u_plot'],
-                           pred_plot=plot_data_for_web['pred_plot'],
-                           error_plot=plot_data_for_web['error_plot'],
-                           training_loss_plot=plot_data_for_web['training_loss_plot'])
+plt.subplot(133)
+plt.imshow(test_pred[0, 0], cmap="viridis")
+plt.colorbar()
+plt.title("FNO prediction $\\hat{u}(x,y)$")
 
-if __name__ == '__main__':
-    # For production deployment, use a WSGI server like Gunicorn or uWSGI
-    # For local development:
-    app.run(debug=True)
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "prediction.png"))
+
+# Plot training loss
+plt.figure()
+plt.semilogy(losses)
+plt.title("Training Loss")
+plt.xlabel("Step")
+plt.ylabel("MSE")
+plt.savefig(os.path.join(output_dir, "training_loss.png"))
+
+# Plot absolute error
+plt.figure()
+plt.imshow(jnp.abs(test_pred[0, 0] - test_y[0, 0]), cmap="inferno")
+plt.colorbar()
+plt.title("Absolute Error $|u - \\hat{u}|$")
+plt.savefig(os.path.join(output_dir, "absolute_error.png"))
