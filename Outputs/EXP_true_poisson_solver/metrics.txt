@@ -1,0 +1,2 @@
+Relative Error: 1.378872
+L2 Error: 0.017362

@@ -1,0 +1,4 @@
+Max Error: 0.001138
+Mean Absolute Error (MAE): 0.000142
+Relative Error: 1301.033936
+L2 Error: 0.007395
